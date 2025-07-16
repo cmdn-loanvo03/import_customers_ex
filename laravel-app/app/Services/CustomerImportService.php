@@ -10,6 +10,7 @@ use App\Repositories\CustomerType\CustomerTypeRepositoryInterface;
 use App\Repositories\Gender\GenderRepositoryInterface;
 use App\Repositories\CustomerImportLog\CustomerImportLogRepositoryInterface;
 use App\Repositories\CustomerFailure\CustomerFailureRepositoryInterface;
+use App\Repositories\TempCustomer\TempCustomerRepositoryInterface;
 use App\Models\{CustomerFailure, CustomerImportLog};
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\DB;
@@ -18,13 +19,15 @@ use Carbon\Carbon;
 
 class CustomerImportService
 {   
-    public function __construct(protected CustomerRepositoryInterface $customerRepo,
-                                protected CustomerAddressRepositoryInterface $addressRepo,
-                                protected CustomerSegmentRepositoryInterface $segmentRepo,
-                                protected CustomerTypeRepositoryInterface $typeRepo,
-                                protected GenderRepositoryInterface $genderRepo,
-                                protected CustomerImportLogRepositoryInterface $importLogRepo,
-                                protected CustomerFailureRepositoryInterface $failureRepo)
+    public function __construct(
+        protected CustomerRepositoryInterface $customerRepo,
+        protected CustomerAddressRepositoryInterface $addressRepo,
+        protected CustomerSegmentRepositoryInterface $segmentRepo,
+        protected CustomerTypeRepositoryInterface $typeRepo,
+        protected GenderRepositoryInterface $genderRepo,
+        protected CustomerImportLogRepositoryInterface $importLogRepo,
+        protected CustomerFailureRepositoryInterface $failureRepo,
+        protected TempCustomerRepositoryInterface $tempCustomerRepo)
     {}
 
     public function importAllFromMinio(): array
@@ -47,30 +50,35 @@ class CustomerImportService
     public function importFile(string $file): array
     {
         \Log::info("🔄 Start importing file: $file");
+        
+        $log = $this->importLogRepo->create([
+            'filename' => $file,
+            'status' => 'success',
+            'total_rows' => 0,
+            'failed_rows' => 0,
+            'message' => null,
+        ]);
+
         $stream = Storage::disk('s3_minio')->readStream($file);
         if (!$stream) {
             return ['status' => 'failed', 'message' => "Unable to open file: $file"];
         }
 
-        $tmpPath = storage_path('app/tmp_valid_rows.csv');
-        $tmpHandle = fopen($tmpPath, 'w');
-        if (!$tmpHandle) {
-            return ['status' => 'failed', 'message' => "Cannot create temp file"];
-        }
-
         $header = null;
         $failures = [];
         $rowNum = 1;
+        $validRows = [];
 
         while (($row = fgetcsv($stream)) !== false) {
             if (!$header) {
                 $header = array_map('trim', $row);
-                fputcsv($tmpHandle, $header); 
                 continue;
             }
+
             if ($rowNum % 10000 === 0) {
                 \Log::info("✅ Processed $rowNum rows from $file");
             }
+
             $rowNum++;
             $data = array_combine($header, $row);
 
@@ -93,14 +101,57 @@ class CustomerImportService
                 continue;
             }
 
-            fputcsv($tmpHandle, $row);
+            try {
+                $gender = $this->genderRepo->findByName($data['gender_name']);
+                $customerType = $this->typeRepo->findByName($data['customer_type_name']);
+                $age = Carbon::parse($data['date_of_birth'])->age;
+
+                $segmentName = $data['total_purchase'] > 100_000_000 ? 'high_value'
+                    : (($data['total_purchase'] < 100_000 && $age > 3) ? 'at_risk' : 'normal');
+                $segment = $this->segmentRepo->findByName($segmentName) ?? $this->segmentRepo->create(['name' => $segmentName]);
+
+                if (!$gender || !$customerType) {
+                    $failures[] = $this->fail($rowNum, $data, 'Missing gender or customer type');
+                    continue;
+                }
+
+                $validRows[] = [
+                    'full_name' => $data['full_name'],
+                    'email' => $data['email'],
+                    'phone' => $data['phone'],
+                    'date_of_birth' => $data['date_of_birth'],
+                    'gender_id' => $gender->id,
+                    'customer_type_id' => $customerType->id,
+                    'segment_id' => $segment->id,
+                    'national_id' => $data['national_id'],
+                    'import_log_id' => $log->id,  
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+
+                if (count($validRows) >= 1000) {
+                    try {
+                        \Log::info("⏳ Inserting batch of 1000 valid rows...");
+                        $this->tempCustomerRepo->insertBatch($validRows);
+                        $validRows = []; 
+                        \Log::info("Successfully inserted 1000 rows into temp_customers");
+                    } catch (\Throwable $e) {
+                        \Log::error(" Failed to insert batch: " . $e->getMessage());
+                    }
+
+                }
+            } catch (\Throwable $e) {
+                $failures[] = $this->fail($rowNum, $data, $e->getMessage());
+            }
         }
 
         fclose($stream);
-        fclose($tmpHandle);
 
-        $log = $this->importLogRepo->create([
-            'filename' => $file,
+        if (!empty($validRows)) {
+            $this->tempCustomerRepo->insertBatch($validRows);
+        }
+
+        $this->importLogRepo->update($log->id,[
             'status' => empty($failures) ? 'success' : 'failed',
             'total_rows' => $rowNum - 1,
             'failed_rows' => count($failures),
@@ -118,84 +169,35 @@ class CustomerImportService
                 $this->failureRepo->insertBatch($batch);
             });
 
-            unlink($tmpPath);
+            $this->tempCustomerRepo->deleteByLogId($log->id);
             return ['status' => 'failed', 'message' => "Import failed: some rows are invalid"];
         }
 
-        $tmpHandle = fopen($tmpPath, 'r');
-        $header = fgetcsv($tmpHandle);
-        $batch = [];
-        $inserted = 0;
-        \Log::info("🚀 All rows valid. Begin inserting into database...");
-
-        DB::beginTransaction();
         try {
-            while (($row = fgetcsv($tmpHandle)) !== false) {
-                $data = array_combine($header, $row);
+            \Log::info("Starting to transfer data from temp_customers table to customers table for import_log_id: {$log->id}");
 
-                $age = Carbon::parse($data['date_of_birth'])->age;
-                
-                $segmentName = $data['total_purchase'] > 100_000_000 ? 'high_value'
-                    : (($data['total_purchase'] < 100_000 && $age > 3) ? 'at_risk' : 'normal');
+            DB::transaction(function () use ($log) {
+                $this->tempCustomerRepo->transferToCustomerTableByLogId($log->id);
 
-                $segment = $this->segmentRepo->findByName($segmentName);
-                if (!$segment) {
-                    $segment = $this->segmentRepo->create(['name' => $segmentName]);
-                }
+                \Log::info("Successfully inserted data from temp_customers to customers.");
 
-                $gender = $this->genderRepo->findByName($data['gender_name']);
-                if (!$gender) {
-                    throw new \Exception("Gender '{$data['gender_name']}' not found");
-                }
+                $this->tempCustomerRepo->deleteByLogId($log->id);
 
-                $customerType = $this->typeRepo->findByName($data['customer_type_name']);
-                if (!$customerType) {
-                    throw new \Exception("CustomerType '{$data['customer_type_name']}' not found");
-                }
+                \Log::info("Deleted temporary data from temp_customers table for import_log_id: {$log->id}");
 
-                $customer = $this->customerRepo->create([
-                    'full_name' => $data['full_name'],
-                    'email' => $data['email'],
-                    'phone' => $data['phone'],
-                    'date_of_birth' => $data['date_of_birth'],
-                    'gender_id' => $gender->id,
-                    'customer_type_id' => $customerType->id,
-                    'segment_id' => $segment->id,
-                    'national_id' => $data['national_id'],
+                $log->update([
+                    'status' => 'success',
+                    'message' => 'Import completed successfully.'
                 ]);
 
-                $this->addressRepo->create([
-                    'customer_id' => $customer->id,
-                    'address_line' => $data['address_line'],
-                    'province' => $data['province'],
-                    'district' => $data['district'],
-                    'ward' => $data['ward'],
-                ]);
+            });
 
-                $batch[] = $customer;
+            \Log::info("🎉 Import for file '{$log->filename}' completed successfully.");
 
-                if (count($batch) >= 1000) {
-                    DB::commit();
-                    DB::beginTransaction();
-                    \Log::info("Committed batch of 1000 customers. Total inserted so far: " . ($inserted + count($batch)));
-                    $inserted += count($batch);
-                    $batch = [];
-                }
-            }
-
-            DB::commit();
-            $inserted += count($batch);
-            \Log::info("Committed final batch. Total customers inserted: $inserted");
-
-            fclose($tmpHandle);
-            unlink($tmpPath);
-
-            return ['status' => 'success', 'message' => "$inserted rows imported from $file"];
+            return ['status' => 'success', 'message' => "Import from {$log->filename} completed successfully."];
         } catch (\Throwable $e) {
-            DB::rollBack();
-            fclose($tmpHandle);
-            unlink($tmpPath);
             $log->update(['status' => 'failed', 'message' => $e->getMessage()]);
+
             return ['status' => 'failed', 'message' => 'DB error: ' . $e->getMessage()];
         }
     }

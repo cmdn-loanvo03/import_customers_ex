@@ -48,6 +48,16 @@ class AppServiceProvider extends ServiceProvider
             \App\Repositories\Gender\GenderRepositoryInterface::class,
             \App\Repositories\Gender\GenderRepository::class
         );
+        
+        $this->app->bind(
+            \App\Repositories\TempCustomer\TempCustomerRepositoryInterface::class,
+            \App\Repositories\TempCustomer\TempCustomerRepository::class
+        );
+        
+        $this->app->bind(
+            \App\Repositories\TempCustomerAddress\TempCustomerAddressRepositoryInterface::class,
+            \App\Repositories\TempCustomerAddress\TempCustomerAddressRepository::class
+        );
     }
 
     /**
