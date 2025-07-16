@@ -108,9 +108,16 @@ class CustomerImportService
         ]);
 
         if (!empty($failures)) {
-            foreach ($failures as $fail) {
-                $this->failureRepo->create(array_merge(['import_log_id' => $log->id], $fail));
-            }
+            collect($failures)->chunk(1000)->each(function ($chunk) use ($log) {
+                $batch = [];
+
+                foreach ($chunk as $fail) {
+                    $batch[] = array_merge(['import_log_id' => $log->id], $fail);
+                }
+
+                $this->failureRepo->insertBatch($batch);
+            });
+
             unlink($tmpPath);
             return ['status' => 'failed', 'message' => "Import failed: some rows are invalid"];
         }

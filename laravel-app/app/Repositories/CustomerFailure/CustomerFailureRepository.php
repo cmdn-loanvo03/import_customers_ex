@@ -9,4 +9,9 @@ class CustomerFailureRepository extends BaseRepository implements CustomerFailur
     {
         return \App\Models\CustomerFailure::class;
     }
+
+    public function insertBatch(array $failures): void
+    {
+        $this->model->insert($failures);
+    }
 }
