@@ -3,7 +3,13 @@
 namespace App\Services;
 
 use App\Http\Requests\CustomerImportRowRequest;
-use App\Repositories\CustomerRepository;
+use App\Repositories\Customer\CustomerRepositoryInterface;
+use App\Repositories\CustomerAddress\CustomerAddressRepositoryInterface;
+use App\Repositories\CustomerSegment\CustomerSegmentRepositoryInterface;
+use App\Repositories\CustomerType\CustomerTypeRepositoryInterface;
+use App\Repositories\Gender\GenderRepositoryInterface;
+use App\Repositories\CustomerImportLog\CustomerImportLogRepositoryInterface;
+use App\Repositories\CustomerFailure\CustomerFailureRepositoryInterface;
 use App\Models\{CustomerFailure, CustomerImportLog};
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\DB;
@@ -11,8 +17,15 @@ use Illuminate\Support\Str;
 use Carbon\Carbon;
 
 class CustomerImportService
-{
-    public function __construct(protected CustomerRepository $repo) {}
+{   
+    public function __construct(protected CustomerRepositoryInterface $customerRepo,
+                                protected CustomerAddressRepositoryInterface $addressRepo,
+                                protected CustomerSegmentRepositoryInterface $segmentRepo,
+                                protected CustomerTypeRepositoryInterface $typeRepo,
+                                protected GenderRepositoryInterface $genderRepo,
+                                protected CustomerImportLogRepositoryInterface $importLogRepo,
+                                protected CustomerFailureRepositoryInterface $failureRepo)
+    {}
 
     public function importAllFromMinio(): array
     {
@@ -86,7 +99,7 @@ class CustomerImportService
         fclose($stream);
         fclose($tmpHandle);
 
-        $log = CustomerImportLog::create([
+        $log = $this->importLogRepo->create([
             'filename' => $file,
             'status' => empty($failures) ? 'success' : 'failed',
             'total_rows' => $rowNum - 1,
@@ -96,9 +109,9 @@ class CustomerImportService
 
         if (!empty($failures)) {
             foreach ($failures as $fail) {
-                CustomerFailure::create(array_merge(['import_log_id' => $log->id], $fail));
+                $this->failureRepo->create(array_merge(['import_log_id' => $log->id], $fail));
             }
-            unlink($tmpPath); 
+            unlink($tmpPath);
             return ['status' => 'failed', 'message' => "Import failed: some rows are invalid"];
         }
 
@@ -112,31 +125,64 @@ class CustomerImportService
         try {
             while (($row = fgetcsv($tmpHandle)) !== false) {
                 $data = array_combine($header, $row);
+
                 $age = Carbon::parse($data['date_of_birth'])->age;
-                $segment = $data['total_purchase'] > 100_000_000 ? 'high_value'
+                
+                $segmentName = $data['total_purchase'] > 100_000_000 ? 'high_value'
                     : (($data['total_purchase'] < 100_000 && $age > 3) ? 'at_risk' : 'normal');
 
-                $batch[] = ['data' => $data, 'segment' => $segment];
+                $segment = $this->segmentRepo->findByName($segmentName);
+                if (!$segment) {
+                    $segment = $this->segmentRepo->create(['name' => $segmentName]);
+                }
 
-                if (count($batch) === 1000) {
-                    foreach ($batch as $item) {
-                        $this->repo->store($item['data'], $item['segment']);
-                    }
+                $gender = $this->genderRepo->findByName($data['gender_name']);
+                if (!$gender) {
+                    throw new \Exception("Gender '{$data['gender_name']}' not found");
+                }
+
+                $customerType = $this->typeRepo->findByName($data['customer_type_name']);
+                if (!$customerType) {
+                    throw new \Exception("CustomerType '{$data['customer_type_name']}' not found");
+                }
+
+                $customer = $this->customerRepo->create([
+                    'full_name' => $data['full_name'],
+                    'email' => $data['email'],
+                    'phone' => $data['phone'],
+                    'date_of_birth' => $data['date_of_birth'],
+                    'gender_id' => $gender->id,
+                    'customer_type_id' => $customerType->id,
+                    'segment_id' => $segment->id,
+                    'national_id' => $data['national_id'],
+                ]);
+
+                $this->addressRepo->create([
+                    'customer_id' => $customer->id,
+                    'address_line' => $data['address_line'],
+                    'province' => $data['province'],
+                    'district' => $data['district'],
+                    'ward' => $data['ward'],
+                ]);
+
+                $batch[] = $customer;
+
+                if (count($batch) >= 1000) {
+                    DB::commit();
+                    DB::beginTransaction();
+                    \Log::info("Committed batch of 1000 customers. Total inserted so far: " . ($inserted + count($batch)));
                     $inserted += count($batch);
                     $batch = [];
                 }
             }
 
-            if (!empty($batch)) {
-                foreach ($batch as $item) {
-                    $this->repo->store($item['data'], $item['segment']);
-                }
-                $inserted += count($batch);
-            }
-
             DB::commit();
+            $inserted += count($batch);
+            \Log::info("Committed final batch. Total customers inserted: $inserted");
+
             fclose($tmpHandle);
             unlink($tmpPath);
+
             return ['status' => 'success', 'message' => "$inserted rows imported from $file"];
         } catch (\Throwable $e) {
             DB::rollBack();
