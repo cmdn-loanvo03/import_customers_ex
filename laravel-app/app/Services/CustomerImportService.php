@@ -104,12 +104,14 @@ class CustomerImportService
 
             if (!$data || count($data) !== count($header)) {
                 $failures[] = $this->fail($rowNum, $data, 'Invalid format or column mismatch');
+                $this->flushFailuresIfNeeded($failures, $log);
                 continue;
             }
 
             $validated = CustomerImportRowRequest::validate($data);
             if (!$validated['status']) {
                 $failures[] = $this->fail($rowNum, $data, implode('; ', $validated['errors']));
+                $this->flushFailuresIfNeeded($failures, $log);
                 continue;
             }
 
@@ -118,6 +120,7 @@ class CustomerImportService
                 preg_match('/@(gmail|yahoo|outlook)\.com$/', $data['email'])
             ) {
                 $failures[] = $this->fail($rowNum, $data, 'Internal user must not use public email domain.');
+                $this->flushFailuresIfNeeded($failures, $log);
                 continue;
             }
 
@@ -127,6 +130,7 @@ class CustomerImportService
 
                 if (!isset(self::GENDER_MAP[$genderName]) || !isset(self::CUSTOMER_TYPE_MAP[$typeName])) {
                     $failures[] = $this->fail($rowNum, $data, 'Invalid gender or customer type');
+                    $this->flushFailuresIfNeeded($failures, $log);
                     continue;
                 }
 
@@ -141,6 +145,7 @@ class CustomerImportService
 
                 if (!isset(self::SEGMENT_MAP[$segmentName])) {
                     $failures[] = $this->fail($rowNum, $data, 'Invalid segment');
+                    $this->flushFailuresIfNeeded($failures, $log);
                     continue;
                 }
 
@@ -195,6 +200,7 @@ class CustomerImportService
                 }
             } catch (\Throwable $e) {
                 $failures[] = $this->fail($rowNum, $data, $e->getMessage());
+                $this->flushFailuresIfNeeded($failures, $log);
             }
         }
 
@@ -216,19 +222,8 @@ class CustomerImportService
         ]);
 
         if (!empty($failures)) {
-            collect($failures)->chunk(1000)->each(function ($chunk) use ($log) {
-                $batch = [];
-
-                foreach ($chunk as $fail) {
-                    $batch[] = array_merge(['import_log_id' => $log->id], $fail);
-                }
-
-                $this->failureRepo->insertBatch($batch);
-            });
-
-            $this->tempCustomerRepo->deleteByLogId($log->id);
-            $this->tempCustomerAddressRepo->deleteByLogId($log->id);
-            return ['status' => 'failed', 'message' => "Import failed: some rows are invalid"];
+            $batch = array_map(fn($fail) => array_merge(['import_log_id' => $log->id], $fail), $failures);
+            $this->failureRepo->insertBatch($batch);
         }
 
         try {
@@ -269,5 +264,20 @@ class CustomerImportService
             'raw_data' => json_encode($data),
             'failed_reason' => $reason,
         ];
+    }
+
+    private function flushFailuresIfNeeded(array &$failures, CustomerImportLog $log): void
+    {
+        if (count($failures) >= 1000) {
+            $batch = array_map(fn($fail) => array_merge(['import_log_id' => $log->id], $fail), $failures);
+
+            try {
+                $this->failureRepo->insertBatch($batch);
+            } catch (\Throwable $e) {
+                \Log::error("Failed to insert failure batch: " . $e->getMessage());
+            }
+
+            $failures = []; 
+        }
     }
 }
