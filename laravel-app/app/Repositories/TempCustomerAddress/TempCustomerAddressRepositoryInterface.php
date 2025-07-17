@@ -2,11 +2,13 @@
 
 namespace App\Repositories\TempCustomerAddress;
 
-interface TempCustomerAddressRepositoryInterface
+use App\Repositories\RepositoryInterface;
+
+interface TempCustomerAddressRepositoryInterface extends RepositoryInterface
 {
     public function insertBatch(array $data): void;
 
     public function transferToCustomerAddressTableByLogId(int $logId): void;
 
-    public function deleteByLogId(int $importLogId): void;
+    public function deleteByLogId(int $logId): void;
 }

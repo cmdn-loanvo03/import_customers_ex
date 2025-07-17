@@ -15,11 +15,10 @@ return new class extends Migration
             $table->bigIncrements('id');
             $table->unsignedBigInteger('import_log_id');
             $table->string('customer_email', 255);
-            $table->string('address_line1', 255);
-            $table->string('address_line2')->nullable();
-            $table->string('city', 100);
+            $table->string('address_line', 255);
             $table->string('province', 100);
-            $table->string('postal_code', 20)->nullable();
+            $table->string('district', 100);
+            $table->string('ward', 100);
             $table->timestamps();
 
             $table->index('import_log_id');

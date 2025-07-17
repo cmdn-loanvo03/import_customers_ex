@@ -11,6 +11,7 @@ use App\Repositories\Gender\GenderRepositoryInterface;
 use App\Repositories\CustomerImportLog\CustomerImportLogRepositoryInterface;
 use App\Repositories\CustomerFailure\CustomerFailureRepositoryInterface;
 use App\Repositories\TempCustomer\TempCustomerRepositoryInterface;
+use App\Repositories\TempCustomerAddress\TempCustomerAddressRepositoryInterface;
 use App\Models\{CustomerFailure, CustomerImportLog};
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\DB;
@@ -27,7 +28,8 @@ class CustomerImportService
         protected GenderRepositoryInterface $genderRepo,
         protected CustomerImportLogRepositoryInterface $importLogRepo,
         protected CustomerFailureRepositoryInterface $failureRepo,
-        protected TempCustomerRepositoryInterface $tempCustomerRepo)
+        protected TempCustomerRepositoryInterface $tempCustomerRepo,
+        protected TempCustomerAddressRepositoryInterface $tempCustomerAddressRepo)
     {}
 
     public function importAllFromMinio(): array
@@ -68,6 +70,7 @@ class CustomerImportService
         $failures = [];
         $rowNum = 1;
         $validRows = [];
+        $validAddressRows = [];
 
         while (($row = fgetcsv($stream)) !== false) {
             if (!$header) {
@@ -129,6 +132,17 @@ class CustomerImportService
                     'updated_at' => now(),
                 ];
 
+                $validAddressRows[] = [
+                    'import_log_id' => $log->id,
+                    'customer_email' => $data['email'],
+                    'address_line' => $data['address_line'],
+                    'province' => $data['province'],
+                    'district' => $data['district'],
+                    'ward' => $data['ward'],
+                    'created_at' => now(),
+                    'updated_at' => now(),
+                ];
+
                 if (count($validRows) >= 1000) {
                     try {
                         \Log::info("⏳ Inserting batch of 1000 valid rows...");
@@ -138,6 +152,17 @@ class CustomerImportService
                     } catch (\Throwable $e) {
                         \Log::error(" Failed to insert batch: " . $e->getMessage());
                     }
+
+                if (count($validAddressRows) >= 1000) {
+                    try {
+                        \Log::info("⏳ Inserting batch of 1000 valid address rows...");
+                        $this->tempCustomerAddressRepo->insertBatch($validAddressRows);
+                        $validAddressRows = []; 
+                        \Log::info("Successfully inserted 1000 rows into temp_customer_addresses");
+                    } catch (\Throwable $e) {
+                        \Log::error(" Failed to insert address batch: " . $e->getMessage());
+                    }
+                }
 
                 }
             } catch (\Throwable $e) {
@@ -149,6 +174,10 @@ class CustomerImportService
 
         if (!empty($validRows)) {
             $this->tempCustomerRepo->insertBatch($validRows);
+        }
+
+        if (!empty($validAddressRows)) {
+            $this->tempCustomerAddressRepo->insertBatch($validAddressRows);
         }
 
         $this->importLogRepo->update($log->id,[
@@ -170,6 +199,7 @@ class CustomerImportService
             });
 
             $this->tempCustomerRepo->deleteByLogId($log->id);
+            $this->tempCustomerAddressRepo->deleteByLogId($log->id);
             return ['status' => 'failed', 'message' => "Import failed: some rows are invalid"];
         }
 
@@ -178,10 +208,12 @@ class CustomerImportService
 
             DB::transaction(function () use ($log) {
                 $this->tempCustomerRepo->transferToCustomerTableByLogId($log->id);
+                $this->tempCustomerAddressRepo->transferToCustomerAddressTableByLogId($log->id);    
 
                 \Log::info("Successfully inserted data from temp_customers to customers.");
 
                 $this->tempCustomerRepo->deleteByLogId($log->id);
+                $this->tempCustomerAddressRepo->deleteByLogId($log->id);
 
                 \Log::info("Deleted temporary data from temp_customers table for import_log_id: {$log->id}");
 

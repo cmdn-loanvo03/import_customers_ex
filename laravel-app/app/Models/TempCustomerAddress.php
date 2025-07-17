@@ -11,10 +11,10 @@ class TempCustomerAddress extends Model
     protected $fillable = [
         'import_log_id',
         'customer_email',
-        'address_line1',
-        'address_line2',
-        'city',
+        'address_line',
         'province',
-        'postal_code',
+        'district',
+        'ward',
     ];
+
 }
