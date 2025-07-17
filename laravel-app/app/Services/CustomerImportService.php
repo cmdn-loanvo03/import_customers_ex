@@ -10,8 +10,7 @@ use App\Repositories\CustomerType\CustomerTypeRepositoryInterface;
 use App\Repositories\Gender\GenderRepositoryInterface;
 use App\Repositories\CustomerImportLog\CustomerImportLogRepositoryInterface;
 use App\Repositories\CustomerFailure\CustomerFailureRepositoryInterface;
-use App\Repositories\TempCustomer\TempCustomerRepositoryInterface;
-use App\Repositories\TempCustomerAddress\TempCustomerAddressRepositoryInterface;
+use App\Repositories\TempCustomer\TempCustomerRepository;
 use App\Models\{CustomerFailure, CustomerImportLog};
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\DB;
@@ -27,9 +26,7 @@ class CustomerImportService
         protected CustomerTypeRepositoryInterface $typeRepo,
         protected GenderRepositoryInterface $genderRepo,
         protected CustomerImportLogRepositoryInterface $importLogRepo,
-        protected CustomerFailureRepositoryInterface $failureRepo,
-        protected TempCustomerRepositoryInterface $tempCustomerRepo,
-        protected TempCustomerAddressRepositoryInterface $tempCustomerAddressRepo)
+        protected CustomerFailureRepositoryInterface $failureRepo)
     {}
 
     public const GENDER_MAP = [
@@ -78,8 +75,13 @@ class CustomerImportService
             'message' => null,
         ]);
 
+        $suffix = Str::random(8); 
+        $tempRepo = new TempCustomerRepository($suffix);
+        $tempRepo->createTable();
+
         $stream = Storage::disk('s3_minio')->readStream($file);
         if (!$stream) {
+            $tempRepo->dropTable();
             return ['status' => 'failed', 'message' => "Unable to open file: $file"];
         }
 
@@ -87,7 +89,6 @@ class CustomerImportService
         $failures = [];
         $rowNum = 1;
         $validRows = [];
-        $validAddressRows = [];
 
         while (($row = fgetcsv($stream)) !== false) {
             if (!$header) {
@@ -160,43 +161,21 @@ class CustomerImportService
                     'customer_type_id' => $typeId,
                     'segment_id' => $segmentId,
                     'national_id' => $data['national_id'],
-                    'import_log_id' => $log->id,
-                    'created_at' => now(),
-                    'updated_at' => now(),
-                ];
-
-                $validAddressRows[] = [
-                    'import_log_id' => $log->id,
-                    'customer_email' => $data['email'],
                     'address_line' => $data['address_line'],
                     'province' => $data['province'],
                     'district' => $data['district'],
                     'ward' => $data['ward'],
-                    'created_at' => now(),
-                    'updated_at' => now(),
                 ];
 
                 if (count($validRows) >= 1000) {
                     try {
                         \Log::info("⏳ Inserting batch of 1000 valid rows...");
-                        $this->tempCustomerRepo->insertBatch($validRows);
+                        $tempRepo->insertBatch($validRows);
                         $validRows = []; 
                         \Log::info("Successfully inserted 1000 rows into temp_customers");
                     } catch (\Throwable $e) {
                         \Log::error(" Failed to insert batch: " . $e->getMessage());
                     }
-
-                if (count($validAddressRows) >= 1000) {
-                    try {
-                        \Log::info("⏳ Inserting batch of 1000 valid address rows...");
-                        $this->tempCustomerAddressRepo->insertBatch($validAddressRows);
-                        $validAddressRows = []; 
-                        \Log::info("Successfully inserted 1000 rows into temp_customer_addresses");
-                    } catch (\Throwable $e) {
-                        \Log::error(" Failed to insert address batch: " . $e->getMessage());
-                    }
-                }
-
                 }
             } catch (\Throwable $e) {
                 $failures[] = $this->fail($rowNum, $data, $e->getMessage());
@@ -204,14 +183,11 @@ class CustomerImportService
             }
         }
 
+        $this->flushFailuresIfNeeded($failures, $log);
         fclose($stream);
 
         if (!empty($validRows)) {
-            $this->tempCustomerRepo->insertBatch($validRows);
-        }
-
-        if (!empty($validAddressRows)) {
-            $this->tempCustomerAddressRepo->insertBatch($validAddressRows);
+            $tempRepo->insertBatch($validRows);
         }
 
         $this->importLogRepo->update($log->id,[
@@ -224,21 +200,16 @@ class CustomerImportService
         if (!empty($failures)) {
             $batch = array_map(fn($fail) => array_merge(['import_log_id' => $log->id], $fail), $failures);
             $this->failureRepo->insertBatch($batch);
+            $tempRepo->dropTable();
         }
 
         try {
             \Log::info("Starting to transfer data from temp_customers table to customers table for import_log_id: {$log->id}");
 
-            DB::transaction(function () use ($log) {
-                $this->tempCustomerRepo->transferToCustomerTableByLogId($log->id);
-                $this->tempCustomerAddressRepo->transferToCustomerAddressTableByLogId($log->id);    
+            DB::transaction(function () use ($tempRepo, $log) {
+                $tempRepo->transfer();
 
-                \Log::info("Successfully inserted data from temp_customers to customers.");
-
-                $this->tempCustomerRepo->deleteByLogId($log->id);
-                $this->tempCustomerAddressRepo->deleteByLogId($log->id);
-
-                \Log::info("Deleted temporary data from temp_customers table for import_log_id: {$log->id}");
+                \Log::info("Successfully inserted data from temp table to customers.");
 
                 $log->update([
                     'status' => 'success',
@@ -249,11 +220,15 @@ class CustomerImportService
 
             \Log::info("🎉 Import for file '{$log->filename}' completed successfully.");
 
+            $tempRepo->dropTable();
+
             return ['status' => 'success', 'message' => "Import from {$log->filename} completed successfully."];
         } catch (\Throwable $e) {
             $log->update(['status' => 'failed', 'message' => $e->getMessage()]);
 
             return ['status' => 'failed', 'message' => 'DB error: ' . $e->getMessage()];
+        } finally {
+            $tempRepo->dropTable();
         }
     }
 
