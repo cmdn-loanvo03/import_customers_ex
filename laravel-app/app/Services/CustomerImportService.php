@@ -32,6 +32,23 @@ class CustomerImportService
         protected TempCustomerAddressRepositoryInterface $tempCustomerAddressRepo)
     {}
 
+    public const GENDER_MAP = [
+        'male' => 1,
+        'female' => 2,
+        'other' => 3,
+    ];
+
+    public const CUSTOMER_TYPE_MAP = [
+        'internal' => 1,
+        'external' => 2,
+    ];
+    
+    public const SEGMENT_MAP = [
+        'high_value' => 1,
+        'at_risk' => 2,
+        'normal' => 3,
+    ];
+
     public function importAllFromMinio(): array
     {
         $disk = Storage::disk('s3_minio');
@@ -105,29 +122,40 @@ class CustomerImportService
             }
 
             try {
-                $gender = $this->genderRepo->findByName($data['gender_name']);
-                $customerType = $this->typeRepo->findByName($data['customer_type_name']);
-                $age = Carbon::parse($data['date_of_birth'])->age;
+                $genderName = strtolower($data['gender_name']);
+                $typeName = strtolower($data['customer_type_name']);
 
-                $segmentName = $data['total_purchase'] > 100_000_000 ? 'high_value'
-                    : (($data['total_purchase'] < 100_000 && $age > 3) ? 'at_risk' : 'normal');
-                $segment = $this->segmentRepo->findByName($segmentName) ?? $this->segmentRepo->create(['name' => $segmentName]);
-
-                if (!$gender || !$customerType) {
-                    $failures[] = $this->fail($rowNum, $data, 'Missing gender or customer type');
+                if (!isset(self::GENDER_MAP[$genderName]) || !isset(self::CUSTOMER_TYPE_MAP[$typeName])) {
+                    $failures[] = $this->fail($rowNum, $data, 'Invalid gender or customer type');
                     continue;
                 }
+
+                $genderId = self::GENDER_MAP[$genderName];
+                $typeId = self::CUSTOMER_TYPE_MAP[$typeName];
+
+                $age = Carbon::parse($data['date_of_birth'])->age;
+
+                $segmentName = $data['total_purchase'] > 100_000_000
+                ? 'high_value'
+                : (($data['total_purchase'] < 100_000 && $age > 3) ? 'at_risk' : 'normal');
+
+                if (!isset(self::SEGMENT_MAP[$segmentName])) {
+                    $failures[] = $this->fail($rowNum, $data, 'Invalid segment');
+                    continue;
+                }
+
+                $segmentId = self::SEGMENT_MAP[$segmentName];
 
                 $validRows[] = [
                     'full_name' => $data['full_name'],
                     'email' => $data['email'],
                     'phone' => $data['phone'],
                     'date_of_birth' => $data['date_of_birth'],
-                    'gender_id' => $gender->id,
-                    'customer_type_id' => $customerType->id,
-                    'segment_id' => $segment->id,
+                    'gender_id' => $genderId,
+                    'customer_type_id' => $typeId,
+                    'segment_id' => $segmentId,
                     'national_id' => $data['national_id'],
-                    'import_log_id' => $log->id,  
+                    'import_log_id' => $log->id,
                     'created_at' => now(),
                     'updated_at' => now(),
                 ];
